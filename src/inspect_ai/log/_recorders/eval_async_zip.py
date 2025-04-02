@@ -15,17 +15,16 @@ class AsyncZip:
     _dirbuffer: bytearray | None
     _dircount: int | None
 
-    def __init__(self, filename: str):
-        self._filename = filename
+    def __init__(self, file: anyio.AsyncFile):
+        self._file = file
 
     async def init(self):
-        if os.path.exists(self._filename):
-            self._file = await anyio.open_file(self._filename, 'r+b')
-            self._dirbuffer, self._dircount = await _read_and_truncate_directory(self._file)
-        else:
-            self._file = await anyio.open_file(self._filename, 'wb')
+        await self._file.seek(0, 2)
+        if await self._file.tell() == 0:  # empty file
             self._dirbuffer = bytearray()
             self._dircount = 0
+        else:
+            self._dirbuffer, self._dircount = await _read_and_truncate_directory(self._file)
 
     async def aclose(self):
         if self._file is None:
@@ -42,7 +41,8 @@ class AsyncZip:
         )
         await self._file.write(cfdh.to_bytes())
 
-        await self._file.aclose()
+        await self._file.flush()
+        # await self._file.aclose()   # don't close because someone else might be using the file again
         self._file = None
 
     async def add_file(self, filename: str, data: bytes, compresslevel: int):
@@ -227,9 +227,6 @@ class EOCD:
 async def _read_and_truncate_directory(file: anyio.AsyncFile) -> tuple[bytearray, int]:
     # This function should read the directory from the file and truncate it.
     endrec = await _read_endrec(file)
-    if endrec is None:
-        # File is empty, return an empty directory
-        return bytearray(), 0
     
     # Read the central directory
     await file.seek(endrec.offset)
@@ -244,10 +241,9 @@ async def _read_and_truncate_directory(file: anyio.AsyncFile) -> tuple[bytearray
     return bytearray(data), endrec.entries_total
 
 # TODO: zip64
-async def _read_endrec(file: anyio.AsyncFile) -> EOCD | None:
+async def _read_endrec(file: anyio.AsyncFile) -> EOCD:
     # jump to the start of the end of the central directory
     await file.seek(-EOCD.SIZE, 2)
-    print(EOCD.SIZE)
     data = await file.read(EOCD.SIZE)
     if len(data) != EOCD.SIZE:
         raise ValueError("Zip file too small to contain end of central directory")
@@ -267,21 +263,23 @@ async def test_main():
         os.remove("test.zip")
 
     print("Creating test.zip")
-    zip_file = AsyncZip("test.zip")
-    await zip_file.init()
-    try:
-        await zip_file.add_file("test.txt", b"Hello, world!", compresslevel=6)
-        await zip_file.add_file("test2.txt", b"Another file", compresslevel=6)
-    finally:
-        await zip_file.aclose()
+    async with await anyio.open_file("test.zip", 'wb') as f:
+        zip_file = AsyncZip(f)
+        await zip_file.init()
+        try:
+            await zip_file.add_file("test.txt", b"Hello, world!", compresslevel=6)
+            await zip_file.add_file("test2.txt", b"Another file", compresslevel=6)
+        finally:
+            await zip_file.aclose()
 
     print("Adding more files to test.zip")
-    zip_file2 = AsyncZip("test.zip")
-    await zip_file2.init()
-    try:
-        await zip_file2.add_file("test3.txt", b"Third file", compresslevel=6)
-    finally:
-        await zip_file2.aclose()
+    async with await anyio.open_file("test.zip", 'r+b') as f:
+        zip_file = AsyncZip(f)
+        await zip_file.init()
+        try:
+            await zip_file.add_file("test3.txt", b"Third file", compresslevel=6)
+        finally:
+            await zip_file.aclose()
 
 if __name__ == "__main__":
     anyio.run(test_main)

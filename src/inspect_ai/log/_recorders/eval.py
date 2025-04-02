@@ -36,6 +36,7 @@ from .._log import (
 )
 from .file import FileRecorder
 from .types import SampleSummary
+from .eval_async_zip import AsyncZip
 
 logger = getLogger(__name__)
 
@@ -267,11 +268,12 @@ def text_inputs(inputs: str | list[ChatMessage]) -> str | list[ChatMessage]:
 
 
 class ZipLogFile:
-    _zip: ZipFile | None
+    _zip: AsyncZip | None
     _temp_file: BinaryIO
     _fs: FileSystem
 
     def __init__(self, file: str) -> None:
+        self._zip = None
         self._file = file
         self._fs = filesystem(file)
         self._lock = anyio.Lock()
@@ -288,7 +290,7 @@ class ZipLogFile:
         summaries: list[SampleSummary],
     ) -> None:
         async with self._lock:
-            self._open()
+            await self._open()
             self._summary_counter = summary_counter
             self._summaries = summaries
             self._log_start = log_start
@@ -300,7 +302,7 @@ class ZipLogFile:
     async def start(self, start: LogStart) -> None:
         async with self._lock:
             self._log_start = start
-            self._zip_writestr(_journal_path(START_JSON), start)
+            await self._zip_writestr(_journal_path(START_JSON), start)
 
     async def buffer_sample(self, sample: EvalSample) -> None:
         async with self._lock:
@@ -312,7 +314,7 @@ class ZipLogFile:
             summaries: list[SampleSummary] = []
             for sample in self._samples:
                 # Write the sample
-                self._zip_writestr(_sample_filename(sample.id, sample.epoch), sample)
+                await self._zip_writestr(_sample_filename(sample.id, sample.epoch), sample)
 
                 # Capture the summary
                 summaries.append(
@@ -338,18 +340,19 @@ class ZipLogFile:
                 self._summary_counter += 1
                 summary_file = _journal_summary_file(self._summary_counter)
                 summary_path = _journal_summary_path(summary_file)
-                self._zip_writestr(summary_path, summaries)
+                await self._zip_writestr(summary_path, summaries)
                 self._summaries.extend(summaries)
 
     async def write(self, filename: str, data: Any) -> None:
         async with self._lock:
-            self._zip_writestr(filename, data)
+            await self._zip_writestr(filename, data)
 
     async def flush(self) -> None:
         async with self._lock:
             # close the zip file so it is flushed
             if self._zip:
-                self._zip.close()
+                await self._zip.aclose()
+                self._zip = None
 
             # read the temp_file (leaves pointer at end for subsequent appends)
             self._temp_file.seek(0)
@@ -361,7 +364,7 @@ class ZipLogFile:
                         f.write(log_bytes)
                 finally:
                     # re-open zip file w/ self.temp_file pointer at end
-                    self._open()
+                    await self._open()
 
     async def close(self) -> EvalLog:
         async with self._lock:
@@ -372,25 +375,25 @@ class ZipLogFile:
             finally:
                 self._temp_file.close()
                 if self._zip:
-                    self._zip.close()
+                    await self._zip.aclose()
+                    self._zip = None
 
     # cleanup zip file if we didn't in normal course
     def __del__(self) -> None:
         if self._zip:
-            self._zip.close()
+            # TODO: is this correct?
+            anyio.from_thread.run(self._zip.aclose())
+            self._zip = None
 
-    def _open(self) -> None:
-        self._zip = ZipFile(
-            self._temp_file,
-            mode="a",
-            compression=ZIP_DEFLATED,
-            compresslevel=5,
-        )
+    async def _open(self) -> None:
+        assert self._zip is None
+        self._zip = AsyncZip(anyio.wrap_file(self._temp_file))
+        await self._zip.init()
 
     # raw unsynchronized version of write
-    def _zip_writestr(self, filename: str, data: Any) -> None:
+    async def _zip_writestr(self, filename: str, data: Any) -> None:
         assert self._zip
-        self._zip.writestr(
+        await self._zip.add_file(
             filename,
             to_json(
                 value=jsonable_python(data),
@@ -398,6 +401,7 @@ class ZipLogFile:
                 exclude_none=True,
                 fallback=lambda _x: None,
             ),
+            compresslevel=5,
         )
 
 
