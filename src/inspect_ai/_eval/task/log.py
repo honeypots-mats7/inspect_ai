@@ -1,6 +1,7 @@
 from importlib import metadata as importlib_metadata
 from inspect import isgenerator
 from typing import Any, Iterator, Literal, cast
+import anyio
 
 from shortuuid import uuid
 
@@ -166,6 +167,7 @@ class TaskLogger:
         # size of flush buffer (how many samples we buffer before hitting storage)
         self.flush_buffer = eval_config.log_buffer or recorder.default_log_buffer()
         self.flush_pending: list[tuple[str | int, int]] = []
+        self.flush_lock = anyio.Lock()
 
     async def init(self) -> None:
         self._location = await self.recorder.log_init(self.eval)
@@ -214,16 +216,17 @@ class TaskLogger:
 
         # flush if requested
         if flush:
-            self.flush_pending.append((sample.id, sample.epoch))
-            if len(self.flush_pending) >= self.flush_buffer:
-                # flush to disk
-                await self.recorder.flush(self.eval)
+            async with self.flush_lock:
+                self.flush_pending.append((sample.id, sample.epoch))
+                if len(self.flush_pending) >= self.flush_buffer:
+                    # flush to disk
+                    await self.recorder.flush(self.eval)
 
-                # notify the event db it can remove these
-                self._buffer_db.remove_samples(self.flush_pending)
+                    # notify the event db it can remove these
+                    self._buffer_db.remove_samples(self.flush_pending)
 
-                # Clear
-                self.flush_pending.clear()
+                    # Clear
+                    self.flush_pending.clear()
 
         # track sucessful samples logged
         if sample.error is None:
