@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 from logging import getLogger
+import time
 from typing import Any, BinaryIO, Literal, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -305,14 +306,15 @@ class ZipLogFile:
             await self._zip_writestr(_journal_path(START_JSON), start)
 
     async def buffer_sample(self, sample: EvalSample) -> None:
-        async with self._lock:
-            self._samples.append(sample)
+        self._samples.append(sample)
 
     async def write_buffered_samples(self) -> None:
+        samples = list(self._samples)
+        self._samples.clear()
         async with self._lock:
             # Write the buffered samples
             summaries: list[SampleSummary] = []
-            for sample in self._samples:
+            for sample in samples:
                 # Write the sample
                 await self._zip_writestr(_sample_filename(sample.id, sample.epoch), sample)
 
@@ -333,7 +335,6 @@ class ZipLogFile:
                         else None,
                     )
                 )
-            self._samples.clear()
 
             # write intermediary summaries and add to master list
             if len(summaries) > 0:

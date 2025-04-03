@@ -3,6 +3,7 @@ from inspect import isgenerator
 from typing import Any, Iterator, Literal, cast
 import anyio
 
+from inspect_ai.log._recorders.buffer.dummy_database import DummySampleBufferDatabase
 from shortuuid import uuid
 
 from inspect_ai._display.core.display import TaskDisplayMetric
@@ -167,11 +168,11 @@ class TaskLogger:
         # size of flush buffer (how many samples we buffer before hitting storage)
         self.flush_buffer = eval_config.log_buffer or recorder.default_log_buffer()
         self.flush_pending: list[tuple[str | int, int]] = []
-        self.flush_lock = anyio.Lock()
+        self._flushing = False
 
     async def init(self) -> None:
         self._location = await self.recorder.log_init(self.eval)
-        self._buffer_db = SampleBufferDatabase(
+        self._buffer_db = DummySampleBufferDatabase(
             location=self._location,
             log_images=self.eval.config.log_images is not False,
             log_shared=self.eval.config.log_shared,
@@ -216,17 +217,19 @@ class TaskLogger:
 
         # flush if requested
         if flush:
-            async with self.flush_lock:
-                self.flush_pending.append((sample.id, sample.epoch))
-                if len(self.flush_pending) >= self.flush_buffer:
-                    # flush to disk
-                    await self.recorder.flush(self.eval)
+            self.flush_pending.append((sample.id, sample.epoch))
+            if len(self.flush_pending) >= self.flush_buffer and not self._flushing:
+                self.flushing = True
+                flush_pending = list(self.flush_pending)
+                # Clear
+                self.flush_pending.clear()
 
-                    # notify the event db it can remove these
-                    self._buffer_db.remove_samples(self.flush_pending)
+                # flush to disk
+                await self.recorder.flush(self.eval)
 
-                    # Clear
-                    self.flush_pending.clear()
+                # notify the event db it can remove these
+                self._buffer_db.remove_samples(flush_pending)
+                self._flushing = False
 
         # track sucessful samples logged
         if sample.error is None:
