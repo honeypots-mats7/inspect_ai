@@ -14,6 +14,7 @@ class AsyncZip:
     _file: anyio.AsyncFile | None
     _dirbuffer: bytearray | None
     _dircount: int | None
+    _64: bool | None
 
     def __init__(self, file: anyio.AsyncFile):
         self._file = file
@@ -23,8 +24,9 @@ class AsyncZip:
         if await self._file.tell() == 0:  # empty file
             self._dirbuffer = bytearray()
             self._dircount = 0
+            self._64 = False
         else:
-            self._dirbuffer, self._dircount = await _read_and_truncate_directory(self._file)
+            self._dirbuffer, self._dircount, self._64 = await _read_and_truncate_directory(self._file)
 
     async def aclose(self):
         if self._file is None:
@@ -33,13 +35,35 @@ class AsyncZip:
         # Write the central directory
         offset = await self._file.tell()
         await self._file.write(self._dirbuffer)
+
+        self._64 |= offset + len(self._dirbuffer) + EOCD.SIZE > 0x7FFFFFFF
+
+        if self._64:
+            # Write the zip64 end of central directory record
+            eocd64 = EOCD64.new_with_defaults(
+                count=self._dircount,
+                size=len(self._dirbuffer),
+                offset=offset
+            )
+            await self._file.write(eocd64.to_bytes())
+
+            # Write the zip64 end of central directory locator
+            locator = EOCD64Locator.new_with_defaults(relative_offset=offset + len(self._dirbuffer))
+            await self._file.write(locator.to_bytes())
+            eocd = EOCD.new_for_zip64()
+        else:
+            # Some sanity checks - we should have already set the _64 flag if any of these are broken
+            assert self._dircount <= 0xFFFF
+            assert len(self._dirbuffer) <= 0x7FFFFFFF
+            assert offset <= 0x7FFFFFFF
+
+            eocd = EOCD.new_with_defaults(
+                count=self._dircount,
+                size=len(self._dirbuffer),
+                offset=offset
+            )
         # Write the end of central directory record
-        cfdh = EOCD.new_with_defaults(
-            count=self._dircount,
-            size=len(self._dirbuffer),
-            offset=offset
-        )
-        await self._file.write(cfdh.to_bytes())
+        await self._file.write(eocd.to_bytes())
 
         await self._file.flush()
         # await self._file.aclose()   # don't close because someone else might be using the file again
@@ -55,24 +79,80 @@ class AsyncZip:
         # Get file offset
         offset = await self._file.tell()
 
+        cd_extras = []
+        cd_extra_struct = '<HH'
+        cd_extra_length = 4
+        local_extras = []
+        local_extra_struct = '<HH'
+        local_extra_length = 4
+        uncompressed_size = len(data)
+        compressed_size = len(compressed_data)
+        if uncompressed_size > 0x7FFFFFFF or compressed_size > 0x7FFFFFFF:
+            # Use ZIP64 extra field
+            self._64 = True
+            cd_extra_struct += 'QQ'
+            cd_extras += [uncompressed_size, compressed_size]
+            cd_extra_length += 16
+            local_extra_struct += 'QQ'
+            local_extras += [uncompressed_size, compressed_size]
+            local_extra_length += 16
+            uncompressed_size = 0xFFFFFFFF
+            compressed_size = 0xFFFFFFFF
+
+        if offset > 0x7FFFFFFF:
+            # Use ZIP64 extra field
+            self._64 = True
+            cd_extra_struct += 'Q'
+            cd_extras.append(offset)
+            cd_extra_length += 8
+            # offset does not appear in the local file header
+            offset = 0xFFFFFFFF
+
+        if len(cd_extras) > 0:
+            cd_extra_field = struct.pack(cd_extra_struct, 1, cd_extra_length-4, *cd_extras)
+        else:
+            cd_extra_field = b""
+            cd_extra_length = 0
+        assert cd_extra_length == len(cd_extra_field)
+
+        if len(local_extras) > 0:
+            local_extra_field = struct.pack(local_extra_struct, 1, local_extra_length-4, *local_extras)
+        else:
+            local_extra_field = b""
+            local_extra_length = 0
+        assert local_extra_length == len(local_extra_field)
+
         # Store the local file header in the buffer
+        dt = time.localtime()
         cdfh = CDFH.new_with_defaults(
+            dt=dt,
             crc=crc,
-            compressed_size=len(compressed_data),
-            uncompressed_size=len(data),
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+            extra_field_length=cd_extra_length,
             filename=filename,
             local_header_offset=offset,
         )
         self._dirbuffer.extend(cdfh.to_bytes())
         self._dirbuffer.extend(filename.encode('utf-8'))
+        self._dirbuffer.extend(cd_extra_field)
         self._dircount += 1
+        self._64 |= self._dircount > 0xFFFF or len(self._dirbuffer) > 0x7FFFFFFF
+        self._64 |= offset + CDFH.SIZE + len(filename) + len(compressed_data) > 0x7FFFFFFF
 
         # Compute and write the local file header
-        lhf = cdfh.to_local()
+        lhf = LocalFileHeader.new_with_defaults(
+            dt=dt,
+            crc=crc,
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+            extra_field_length=local_extra_length,
+            filename=filename
+        )
         await self._file.write(lhf.to_bytes())
         # Write the filename
         await self._file.write(filename.encode('utf-8'))
-        # No extra field
+        await self._file.write(local_extra_field)
         # Write the compressed data to the file
         await self._file.write(compressed_data)
 
@@ -103,6 +183,36 @@ class LocalFileHeader:
                            self.uncompressed_size, self.filename_length,
                            self.extra_field_length)
 
+    @classmethod
+    def new_with_defaults(cls,
+                          dt: tuple,
+                          crc:int,
+                          compressed_size: int,
+                          uncompressed_size: int,
+                          extra_field_length: int,
+                          filename:str) -> LocalFileHeader:
+        dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
+        dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
+        return cls(
+            signature=cls.MAGIC,
+            extract_version=DEFAULT_VERSION,
+            extract_system=0,
+            general_purpose_flag_bits=0,
+            compression_method=ZIP_DEFLATED,
+            last_mod_time=dostime,
+            last_mod_date=dosdate,
+            crc=crc,
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+            filename_length=len(filename),
+            extra_field_length=extra_field_length
+        )
+
+@dataclass
+class Extra64:
+    header_id: int
+
+
 @dataclass
 class CDFH:
     signature: bytes
@@ -129,25 +239,15 @@ class CDFH:
     MAGIC = b"PK\001\002"
     SIZE = struct.calcsize(STRUCT)
 
-    def to_local(self):
-        return LocalFileHeader(
-            signature=LocalFileHeader.MAGIC,
-            extract_version=self.extract_version,
-            extract_system=self.extract_system,
-            general_purpose_flag_bits=self.flat_bits,
-            compression_method=self.compress_type,
-            last_mod_time=self.time,
-            last_mod_date=self.date,
-            crc=self.crc,
-            compressed_size=self.compressed_size,
-            uncompressed_size=self.uncompressed_size,
-            filename_length=self.filename_length,
-            extra_field_length=self.extra_field_length
-        )
-
     @classmethod
-    def new_with_defaults(cls, crc:int, compressed_size: int, uncompressed_size: int, filename:str, local_header_offset: int) -> CDFH:
-        dt = time.localtime()
+    def new_with_defaults(cls,
+                          dt: tuple,
+                          crc:int,
+                          compressed_size: int,
+                          uncompressed_size: int,
+                          extra_field_length: int,
+                          filename:str,
+                          local_header_offset: int) -> CDFH:
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
         dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
         return cls(
@@ -164,7 +264,7 @@ class CDFH:
             compressed_size=compressed_size,
             uncompressed_size=uncompressed_size,
             filename_length=len(filename),
-            extra_field_length=0,
+            extra_field_length=extra_field_length,
             comment_length=0,
             disk_number_start=0,
             internal_file_attributes=0,
@@ -183,6 +283,81 @@ class CDFH:
                            self.disk_number_start, self.internal_file_attributes,
                            self.external_file_attributes,
                            self.local_header_offset)
+
+@dataclass
+class EOCD64Locator:
+    signature: bytes
+    disk_number: int
+    relative_offset: int
+    disks: int
+
+    STRUCT = b"<4sLQL"
+    MAGIC = b"PK\006\007"
+    SIZE = struct.calcsize(STRUCT)
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) != cls.SIZE:
+            raise ValueError("Invalid EOCD locator size")
+        return cls(*struct.unpack(cls.STRUCT, data))
+    
+    def to_bytes(self) -> bytes:
+        return struct.pack(self.STRUCT, self.signature, self.disk_number,
+                           self.relative_offset, self.disks)
+
+    @classmethod
+    def new_with_defaults(cls, relative_offset: int) -> EOCD64Locator:
+        return cls(
+            signature=cls.MAGIC,
+            disk_number=0,
+            relative_offset=relative_offset,
+            disks=1
+        )
+
+@dataclass
+class EOCD64:
+    signature: bytes
+    size_minus_12: int
+    version_made_by: int
+    version_needed: int
+    disk_number: int
+    disk_start: int
+    entries_this_disk: int
+    entries_total: int
+    size: int
+    offset: int
+
+    STRUCT = b"<4sQ2H2L4Q"
+    MAGIC = b"PK\006\006"
+    SIZE = struct.calcsize(STRUCT)
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) != cls.SIZE:
+            raise ValueError("Invalid EOCD64 size")
+        return cls(*struct.unpack(cls.STRUCT, data))
+    
+    def to_bytes(self) -> bytes:
+        return struct.pack(self.STRUCT, self.signature, self.size_minus_12,
+                           self.version_made_by, self.version_needed,
+                           self.disk_number, self.disk_start,
+                           self.entries_this_disk, self.entries_total,
+                           self.size, self.offset)
+    
+    @classmethod
+    def new_with_defaults(cls, count: int, size: int, offset: int) -> EOCD64:
+        return cls(
+            signature=cls.MAGIC,
+            size_minus_12=cls.SIZE - 12,
+            version_made_by=DEFAULT_VERSION,
+            version_needed=DEFAULT_VERSION,
+            disk_number=0,
+            disk_start=0,
+            entries_this_disk=count,
+            entries_total=count,
+            size=size,
+            offset=offset
+        )
 
 @dataclass
 class EOCD:
@@ -210,6 +385,24 @@ class EOCD:
                            self.disk_start, self.entries_this_disk,
                            self.entries_total, self.size, self.offset,
                            self.comment_size)
+    
+    def is_zip64(self) -> bool:
+        return (self.disk_number == 0xFFFF and self.disk_start == 0xFFFF and
+               self.entries_this_disk == 0xFFFF and self.entries_total == 0xFFFF and
+               self.size == 0xFFFFFFFF and self.offset == 0xFFFFFFFF)
+
+    @classmethod
+    def new_for_zip64(cls) -> EOCD:
+        return cls(
+            signature=cls.MAGIC,
+            disk_number=0xFFFF,
+            disk_start=0xFFFF,
+            entries_this_disk=0xFFFF,
+            entries_total=0xFFFF,
+            size=0xFFFFFFFF,
+            offset=0xFFFFFFFF,
+            comment_size=0
+        )
 
     @classmethod
     def new_with_defaults(cls, count: int, size: int, offset: int) -> EOCD:
@@ -224,7 +417,7 @@ class EOCD:
             comment_size=0
         )
 
-async def _read_and_truncate_directory(file: anyio.AsyncFile) -> tuple[bytearray, int]:
+async def _read_and_truncate_directory(file: anyio.AsyncFile) -> tuple[bytearray, int, bool]:
     # This function should read the directory from the file and truncate it.
     endrec = await _read_endrec(file)
     
@@ -238,10 +431,9 @@ async def _read_and_truncate_directory(file: anyio.AsyncFile) -> tuple[bytearray
     await file.seek(endrec.offset)
     await file.truncate()
 
-    return bytearray(data), endrec.entries_total
+    return bytearray(data), endrec.entries_total, isinstance(endrec, EOCD64)
 
-# TODO: zip64
-async def _read_endrec(file: anyio.AsyncFile) -> EOCD:
+async def _read_endrec(file: anyio.AsyncFile) -> EOCD | EOCD64:
     # jump to the start of the end of the central directory
     await file.seek(-EOCD.SIZE, 2)
     data = await file.read(EOCD.SIZE)
@@ -253,12 +445,42 @@ async def _read_endrec(file: anyio.AsyncFile) -> EOCD:
         raise ValueError("End of central directory comment length not set to 0")
     
     endrec = EOCD.from_bytes(data)
-    if endrec.disk_number != 0 or endrec.disk_start != 0 or endrec.entries_this_disk != endrec.entries_total:
+    if endrec.is_zip64():
+        # End of Central Directory 64 Locator
+        await file.seek(-EOCD.SIZE - EOCD64Locator.SIZE, 2)
+        data = await file.read(EOCD64Locator.SIZE)
+        if len(data) != EOCD64Locator.SIZE:
+            raise ValueError("Zip file too small to contain zip64 end of central directory locator")
+        if data[0:4] != EOCD64Locator.MAGIC:
+            raise ValueError("Zip64 end of central directory locator magic number not found")
+
+        # Read the EOCD64 locator
+        locator = EOCD64Locator.from_bytes(data)
+        if locator.disk_number != 0 or locator.disks != 1:
+            raise ValueError("Zip file is split across multiple disks, not supported")
+        
+        # End of Central Directory 64
+        await file.seek(locator.relative_offset)
+        data = await file.read(EOCD64.SIZE)
+        if len(data) != EOCD64.SIZE:
+            raise ValueError("Zip file too small to contain zip64 end of central directory")
+        if data[0:4] != EOCD64.MAGIC:
+            raise ValueError("Zip64 end of central directory magic number not found")
+        endrec = EOCD64.from_bytes(data)
+        if endrec.size_minus_12 != EOCD64.SIZE - 12:
+            raise ValueError("Unexpected size of zip64 end of central directory - extensible data sector not supported")
+
+    if endrec.disk_number != 0 or endrec.disk_start != 0:
+        raise ValueError("Zip file is split across multiple disks, not supported")
+    if endrec.entries_this_disk != endrec.entries_total:
         raise ValueError("Zip file is split across multiple disks, not supported")
     
     return endrec
 
 async def test_main():
+    def random_bytes(n: int) -> bytes:
+        return os.urandom(n)
+
     if os.path.exists("test.zip"):
         os.remove("test.zip")
 
@@ -267,7 +489,7 @@ async def test_main():
         zip_file = AsyncZip(f)
         await zip_file.init()
         try:
-            await zip_file.add_file("test.txt", b"Hello, world!", compresslevel=6)
+            await zip_file.add_file("test.txt", random_bytes(0x80000000), compresslevel=6)
             await zip_file.add_file("test2.txt", b"Another file", compresslevel=6)
         finally:
             await zip_file.aclose()
