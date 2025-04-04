@@ -15,11 +15,14 @@ class AsyncZip:
     _dirbuffer: bytearray | None
     _dircount: int | None
     _64: bool | None
+    _closing: bool
 
     def __init__(self, file: anyio.AsyncFile):
         self._file = file
+        self._closing = False
 
     async def init(self):
+        assert not self._closing
         await self._file.seek(0, 2)
         if await self._file.tell() == 0:  # empty file
             self._dirbuffer = bytearray()
@@ -29,6 +32,7 @@ class AsyncZip:
             self._dirbuffer, self._dircount, self._64 = await _read_and_truncate_directory(self._file)
 
     async def aclose(self):
+        self._closing = True
         if self._file is None:
             return
         
@@ -70,6 +74,8 @@ class AsyncZip:
         self._file = None
 
     async def add_file(self, filename: str, data: bytes, compresslevel: int):
+        assert not self._closing
+
         # Compress the data
         compressed_data = zlib.compress(data, level=compresslevel, wbits=-15)
 
@@ -96,8 +102,11 @@ class AsyncZip:
             local_extra_struct += 'QQ'
             local_extras += [uncompressed_size, compressed_size]
             local_extra_length += 16
-            uncompressed_size = 0xFFFFFFFF
-            compressed_size = 0xFFFFFFFF
+            uncompressed_size_field = 0xFFFFFFFF
+            compressed_size_field = 0xFFFFFFFF
+        else:
+            uncompressed_size_field = uncompressed_size
+            compressed_size_field = compressed_size
 
         if offset > 0x7FFFFFFF:
             # Use ZIP64 extra field
@@ -106,7 +115,9 @@ class AsyncZip:
             cd_extras.append(offset)
             cd_extra_length += 8
             # offset does not appear in the local file header
-            offset = 0xFFFFFFFF
+            offset_field = 0xFFFFFFFF
+        else:
+            offset_field = offset
 
         if len(cd_extras) > 0:
             cd_extra_field = struct.pack(cd_extra_struct, 1, cd_extra_length-4, *cd_extras)
@@ -124,37 +135,44 @@ class AsyncZip:
 
         # Store the local file header in the buffer
         dt = time.localtime()
+        filename_bytes = filename.encode('utf-8')
         cdfh = CDFH.new_with_defaults(
             dt=dt,
             crc=crc,
-            compressed_size=compressed_size,
-            uncompressed_size=uncompressed_size,
+            compressed_size=compressed_size_field,
+            uncompressed_size=uncompressed_size_field,
+            filename_length=len(filename_bytes),
             extra_field_length=cd_extra_length,
-            filename=filename,
-            local_header_offset=offset,
+            local_header_offset=offset_field,
         )
-        self._dirbuffer.extend(cdfh.to_bytes())
-        self._dirbuffer.extend(filename.encode('utf-8'))
-        self._dirbuffer.extend(cd_extra_field)
-        self._dircount += 1
-        self._64 |= self._dircount > 0xFFFF or len(self._dirbuffer) > 0x7FFFFFFF
-        self._64 |= offset + CDFH.SIZE + len(filename) + len(compressed_data) > 0x7FFFFFFF
 
         # Compute and write the local file header
         lhf = LocalFileHeader.new_with_defaults(
             dt=dt,
             crc=crc,
-            compressed_size=compressed_size,
-            uncompressed_size=uncompressed_size,
+            compressed_size=compressed_size_field,
+            uncompressed_size=uncompressed_size_field,
+            filename_length=len(filename_bytes),
             extra_field_length=local_extra_length,
-            filename=filename
         )
+        # Do this in this order in case an exception (Ctrl+C) is thrown in the middle
+        # (in this case, it should be safe writing some extra garbage to the file that isn't
+        # recorded in the central directory)
+
+        # Write the local file header
         await self._file.write(lhf.to_bytes())
         # Write the filename
-        await self._file.write(filename.encode('utf-8'))
+        await self._file.write(filename_bytes)
         await self._file.write(local_extra_field)
         # Write the compressed data to the file
         await self._file.write(compressed_data)
+
+        self._64 |= self._dircount > 0xFFFF or len(self._dirbuffer) > 0x7FFFFFFF
+        self._64 |= offset + LocalFileHeader.SIZE + len(filename_bytes) + local_extra_length + len(compressed_data) > 0x7FFFFFFF
+        self._dirbuffer.extend(cdfh.to_bytes())
+        self._dirbuffer.extend(filename_bytes)
+        self._dirbuffer.extend(cd_extra_field)
+        self._dircount += 1
 
 @dataclass
 class LocalFileHeader:
@@ -189,8 +207,8 @@ class LocalFileHeader:
                           crc:int,
                           compressed_size: int,
                           uncompressed_size: int,
-                          extra_field_length: int,
-                          filename:str) -> LocalFileHeader:
+                          filename_length: int,
+                          extra_field_length: int) -> LocalFileHeader:
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
         dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
         return cls(
@@ -204,14 +222,15 @@ class LocalFileHeader:
             crc=crc,
             compressed_size=compressed_size,
             uncompressed_size=uncompressed_size,
-            filename_length=len(filename),
+            filename_length=filename_length,
             extra_field_length=extra_field_length
         )
-
-@dataclass
-class Extra64:
-    header_id: int
-
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> LocalFileHeader:
+        if len(data) != cls.SIZE:
+            raise ValueError("Invalid Local File Header size")
+        return cls(*struct.unpack(cls.STRUCT, data))
 
 @dataclass
 class CDFH:
@@ -245,8 +264,8 @@ class CDFH:
                           crc:int,
                           compressed_size: int,
                           uncompressed_size: int,
+                          filename_length: int,
                           extra_field_length: int,
-                          filename:str,
                           local_header_offset: int) -> CDFH:
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
         dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
@@ -263,7 +282,7 @@ class CDFH:
             crc=crc,
             compressed_size=compressed_size,
             uncompressed_size=uncompressed_size,
-            filename_length=len(filename),
+            filename_length=filename_length,
             extra_field_length=extra_field_length,
             comment_length=0,
             disk_number_start=0,
@@ -283,6 +302,12 @@ class CDFH:
                            self.disk_number_start, self.internal_file_attributes,
                            self.external_file_attributes,
                            self.local_header_offset)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> CDFH:
+        if len(data) != cls.SIZE:
+            raise ValueError("Invalid CDFH size")
+        return cls(*struct.unpack(cls.STRUCT, data))
 
 @dataclass
 class EOCD64Locator:

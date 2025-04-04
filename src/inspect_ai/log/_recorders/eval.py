@@ -311,9 +311,15 @@ class ZipLogFile:
     async def write_buffered_samples(self) -> None:
         samples = list(self._samples)
         self._samples.clear()
+
         async with self._lock:
             # Write the buffered samples
             summaries: list[SampleSummary] = []
+
+            if len(samples) > 0 and self._zip is None:
+                print("=== write_buffered_samples _zip is None ===")
+                await self._open()
+
             for sample in samples:
                 # Write the sample
                 await self._zip_writestr(_sample_filename(sample.id, sample.epoch), sample)
@@ -352,8 +358,9 @@ class ZipLogFile:
         async with self._lock:
             # close the zip file so it is flushed
             if self._zip:
-                await self._zip.aclose()
+                z = self._zip
                 self._zip = None
+                await z.aclose()
 
             # read the temp_file (leaves pointer at end for subsequent appends)
             self._temp_file.seek(0)
@@ -371,25 +378,34 @@ class ZipLogFile:
         async with self._lock:
             # read the log from the temp file then close it
             try:
+                if self._zip:
+                    z = self._zip
+                    self._zip = None
+                    await z.aclose()
+
                 self._temp_file.seek(0)
                 return _read_log(self._temp_file, self._file)
             finally:
                 self._temp_file.close()
-                if self._zip:
-                    await self._zip.aclose()
-                    self._zip = None
 
     # cleanup zip file if we didn't in normal course
     def __del__(self) -> None:
         if self._zip:
-            # TODO: is this correct?
-            anyio.from_thread.run(self._zip.aclose())
+            print("=== __del__ ===")
+            z = self._zip
             self._zip = None
+            # TODO: is this correct?
+            anyio.to_thread.run_sync(lambda: anyio.from_thread.run(z.aclose()))
 
     async def _open(self) -> None:
         assert self._zip is None
-        self._zip = AsyncZip(anyio.wrap_file(self._temp_file))
-        await self._zip.init()
+        try:
+            self._zip = AsyncZip(anyio.wrap_file(self._temp_file))
+            await self._zip.init()
+        except:
+            print("=== _open exception ===")
+            self._zip = None
+            raise
 
     # raw unsynchronized version of write
     async def _zip_writestr(self, filename: str, data: Any) -> None:
