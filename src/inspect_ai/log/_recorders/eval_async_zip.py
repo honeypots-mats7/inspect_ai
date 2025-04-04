@@ -287,7 +287,7 @@ class CDFH:
             comment_length=0,
             disk_number_start=0,
             internal_file_attributes=0,
-            external_file_attributes=0,
+            external_file_attributes=0o600 << 16,
             local_header_offset=local_header_offset
         )
 
