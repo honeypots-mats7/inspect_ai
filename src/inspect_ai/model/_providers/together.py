@@ -3,7 +3,7 @@ from json import dumps
 from typing import Any
 
 import httpx
-from openai import BadRequestError
+from openai import APIStatusError
 from openai.types.chat import (
     ChatCompletion,
 )
@@ -105,7 +105,7 @@ class TogetherAIAPI(OpenAIAPI):
         return DEFAULT_MAX_TOKENS
 
     @override
-    def handle_bad_request(self, ex: BadRequestError) -> ModelOutput | Exception:
+    def handle_bad_request(self, ex: APIStatusError) -> ModelOutput | Exception:
         response = ex.response.json()
         if "error" in response and "message" in response.get("error"):
             content = response.get("error").get("message")
@@ -117,6 +117,14 @@ class TogetherAIAPI(OpenAIAPI):
             )
         else:
             return ex
+
+    @override
+    def set_logprobs_params(
+        self, params: dict[str, Any], config: GenerateConfig
+    ) -> dict[str, Any]:
+        if config.logprobs is True:
+            params["logprobs"] = 1
+        return params
 
     # Together has a slightly different logprobs structure to OpenAI, so we need to remap it.
     def _chat_choices_from_response(

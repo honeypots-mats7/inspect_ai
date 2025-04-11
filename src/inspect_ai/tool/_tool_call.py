@@ -44,7 +44,7 @@ class ToolCall:
     arguments: dict[str, Any]
     """Arguments to function."""
 
-    internal: JsonValue | None = Field(default=None)
+    internal: JsonValue | None = field(default=None)
     """Model provider specific payload - typically used to aid transformation back to model types."""
 
     parse_error: str | None = field(default=None)
@@ -52,6 +52,9 @@ class ToolCall:
 
     view: ToolCallContent | None = field(default=None)
     """Custom view of tool call input."""
+
+    type: str | None = field(default=None)
+    """Tool call type (deprecated)."""
 
 
 @dataclass

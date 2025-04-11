@@ -13,6 +13,7 @@ from openai import (
     AsyncOpenAI,
     BadRequestError,
     RateLimitError,
+    UnprocessableEntityError,
 )
 from openai._types import NOT_GIVEN
 from openai.types.chat import ChatCompletion
@@ -295,13 +296,13 @@ class OpenAIAPI(ModelAPI):
                     else None
                 ),
             ), model_call()
-        except BadRequestError as e:
+        except (BadRequestError, UnprocessableEntityError) as e:
             return self.handle_bad_request(e), model_call()
 
     def on_response(self, response: dict[str, Any]) -> None:
         pass
 
-    def handle_bad_request(self, ex: BadRequestError) -> ModelOutput | Exception:
+    def handle_bad_request(self, ex: APIStatusError) -> ModelOutput | Exception:
         return openai_handle_bad_request(self.model_name, ex)
 
     def _chat_choices_from_response(
@@ -368,10 +369,7 @@ class OpenAIAPI(ModelAPI):
             params["top_p"] = config.top_p
         if config.num_choices is not None:
             params["n"] = config.num_choices
-        if config.logprobs is not None:
-            params["logprobs"] = config.logprobs
-        if config.top_logprobs is not None:
-            params["top_logprobs"] = config.top_logprobs
+        params = self.set_logprobs_params(params, config)
         if tools and config.parallel_tool_calls is not None and not self.is_o_series():
             params["parallel_tool_calls"] = config.parallel_tool_calls
         if (
@@ -394,6 +392,15 @@ class OpenAIAPI(ModelAPI):
                 ),
             )
 
+        return params
+
+    def set_logprobs_params(
+        self, params: dict[str, Any], config: GenerateConfig
+    ) -> dict[str, Any]:
+        if config.logprobs is not None:
+            params["logprobs"] = config.logprobs
+        if config.top_logprobs is not None:
+            params["top_logprobs"] = config.top_logprobs
         return params
 
 
