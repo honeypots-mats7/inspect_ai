@@ -2,7 +2,7 @@ import contextlib
 import functools
 import sys
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from logging import getLogger
@@ -101,7 +101,6 @@ from .images import (
 )
 from .log import TaskLogger, collect_eval_data, log_start
 from .results import eval_results
-from .rundir import set_task_chdir
 from .sandbox import sandboxenv_context
 from .util import sample_messages, slice_dataset
 
@@ -155,154 +154,134 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
     # init task context
     init_task_context(model, model_roles, options.task.approval, generate_config)
 
-    # establish chdir for duration of execution (if a task has chdir=True)
-    with set_task_chdir(task):
-        # track stats and error
-        results: EvalResults | None = None
-        reductions: list[EvalSampleReductions] | None = None
-        stats = EvalStats(started_at=iso_now())
+    # track stats and error
+    results: EvalResults | None = None
+    reductions: list[EvalSampleReductions] | None = None
+    stats = EvalStats(started_at=iso_now())
 
-        # handle sample errors (raise as required)
-        sample_error_handler = SampleErrorHandler(
-            config.fail_on_error, len(task.dataset)
-        )
+    # handle sample errors (raise as required)
+    sample_error_handler = SampleErrorHandler(config.fail_on_error, len(task.dataset))
 
-        # resolve some config
-        model_name = ModelName(model)
-        epochs = config.epochs if config.epochs else DEFAULT_EPOCHS
-        sandbox_cleanup = config.sandbox_cleanup is not False
-        log_images = config.log_images is not False
-        log_samples = config.log_samples is not False
+    # resolve some config
+    model_name = ModelName(model)
+    epochs = config.epochs if config.epochs else DEFAULT_EPOCHS
+    sandbox_cleanup = config.sandbox_cleanup is not False
+    log_images = config.log_images is not False
+    log_samples = config.log_samples is not False
 
-        # resolve dataset
-        _, samples, states = await resolve_dataset(
-            dataset=task.dataset,
-            model_name=model_name,
-            limit=config.limit,
-            sample_id=config.sample_id,
-            epochs=epochs,
-            log_images=log_images,
-            message_limit=config.message_limit,
-            token_limit=config.token_limit,
-        )
+    # resolve dataset
+    _, samples, states = await resolve_dataset(
+        dataset=task.dataset,
+        model_name=model_name,
+        limit=config.limit,
+        sample_id=config.sample_id,
+        epochs=epochs,
+        log_images=log_images,
+        message_limit=config.message_limit,
+        token_limit=config.token_limit,
+    )
 
-        # resolve the plan (unroll chains)
-        solver = solver or task.solver
-        if isinstance(solver, Plan):
-            plan = solver
-        elif isinstance(solver, Chain):
-            plan = Plan(list(solver), cleanup=task.cleanup, internal=True)
-        else:
-            plan = Plan(unroll(solver), cleanup=task.cleanup, internal=True)
+    # resolve the plan (unroll chains)
+    solver = solver or task.solver
+    if isinstance(solver, Plan):
+        plan = solver
+    elif isinstance(solver, Chain):
+        plan = Plan(list(solver), cleanup=task.cleanup, internal=True)
+    else:
+        plan = Plan(unroll(solver), cleanup=task.cleanup, internal=True)
 
-        # add setup solver(s) if specified
-        if task.setup:
-            plan.steps = unroll(task.setup) + plan.steps
+    # add setup solver(s) if specified
+    if task.setup:
+        plan.steps = unroll(task.setup) + plan.steps
 
-        # resolve the scorer
-        score = score and task.scorer is not None
-        scorers: list[Scorer] | None = task.scorer if (score and task.scorer) else None
-        scorer_profiles = (
-            [
-                registry_log_name(scorer)
-                for scorer in scorers
-                if is_registry_object(scorer)
-            ]
-            if scorers is not None
-            else ["(none)"]
-        )
+    # resolve the scorer
+    score = score and task.scorer is not None
+    scorers: list[Scorer] | None = task.scorer if (score and task.scorer) else None
+    scorer_profiles = (
+        [registry_log_name(scorer) for scorer in scorers if is_registry_object(scorer)]
+        if scorers is not None
+        else ["(none)"]
+    )
 
-        # compute an eval directory relative log location if we can
-        if PurePath(logger.location).is_relative_to(PurePath(eval_wd)):
-            log_location = PurePath(logger.location).relative_to(eval_wd).as_posix()
-        else:
-            log_location = logger.location
+    # compute an eval directory relative log location if we can
+    if PurePath(logger.location).is_relative_to(PurePath(eval_wd)):
+        log_location = PurePath(logger.location).relative_to(eval_wd).as_posix()
+    else:
+        log_location = logger.location
 
-        # create task profile for display
-        profile = TaskProfile(
-            name=task.name,
-            file=logger.eval.task_file,
-            model=model_name,
-            dataset=task.dataset.name or "(samples)",
-            scorer=", ".join(scorer_profiles),
-            samples=len(samples),
-            steps=len(samples) * SAMPLE_TOTAL_PROGRESS_UNITS,
-            eval_config=config,
-            task_args=logger.eval.task_args,
-            generate_config=generate_config,
-            tags=tags,
-            log_location=log_location,
-        )
+    # create task profile for display
+    profile = TaskProfile(
+        name=task.name,
+        file=logger.eval.task_file,
+        model=model_name,
+        dataset=task.dataset.name or "(samples)",
+        scorer=", ".join(scorer_profiles),
+        samples=len(samples),
+        steps=len(samples) * SAMPLE_TOTAL_PROGRESS_UNITS,
+        eval_config=config,
+        task_args=logger.eval.task_args,
+        generate_config=generate_config,
+        tags=tags,
+        log_location=log_location,
+    )
 
-        with display().task(
-            profile,
-        ) as td:
-            try:
-                # start the log
-                await log_start(logger, plan, generate_config)
+    with display().task(
+        profile,
+    ) as td:
+        try:
+            # start the log
+            await log_start(logger, plan, generate_config)
 
-                with td.progress() as p:
-                    # forward progress
-                    def progress(number: int) -> None:
-                        p.update(number)
+            with td.progress() as p:
+                # forward progress
+                def progress(number: int) -> None:
+                    p.update(number)
 
-                    # provide solvers a function that they can use to generate output
-                    async def generate(
-                        state: TaskState,
-                        tool_calls: Literal["loop", "single", "none"] = "loop",
-                        cache: bool | CachePolicy = False,
-                        **kwargs: Unpack[GenerateConfigArgs],
-                    ) -> TaskState:
-                        return await task_generate(
-                            model=model,
-                            state=state,
-                            tool_calls=tool_calls,
-                            cache=cache,
-                            config=generate_config.merge(kwargs),
-                        )
-
-                    # set generate for fork module
-                    set_task_generate(generate)
-
-                    # semaphore to limit concurrency
-                    sample_semaphore = create_sample_semaphore(
-                        config, generate_config, model.api
+                # provide solvers a function that they can use to generate output
+                async def generate(
+                    state: TaskState,
+                    tool_calls: Literal["loop", "single", "none"] = "loop",
+                    cache: bool | CachePolicy = False,
+                    **kwargs: Unpack[GenerateConfigArgs],
+                ) -> TaskState:
+                    return await task_generate(
+                        model=model,
+                        state=state,
+                        tool_calls=tool_calls,
+                        cache=cache,
+                        config=generate_config.merge(kwargs),
                     )
 
-                    # track when samples complete and update progress as we go
-                    progress_results: list[dict[str, SampleScore]] = []
+                # set generate for fork module
+                set_task_generate(generate)
 
-                    def update_metrics(metrics: list[TaskDisplayMetric]) -> None:
-                        td.update_metrics(metrics)
-                        logger.update_metrics(metrics)
+                # semaphore to limit concurrency
+                sample_semaphore = create_sample_semaphore(
+                    config, generate_config, model.api
+                )
 
-                    update_metrics_display = update_metrics_display_fn(
-                        update_metrics,
-                        display_metrics=profile.eval_config.score_display is not False,
+                # track when samples complete and update progress as we go
+                progress_results: list[dict[str, SampleScore]] = []
+
+                def update_metrics(metrics: list[TaskDisplayMetric]) -> None:
+                    td.update_metrics(metrics)
+                    logger.update_metrics(metrics)
+
+                update_metrics_display = update_metrics_display_fn(
+                    update_metrics,
+                    display_metrics=profile.eval_config.score_display is not False,
+                )
+
+                def sample_complete(sample_score: dict[str, SampleScore]) -> None:
+                    # Capture the result
+                    progress_results.append(sample_score)
+
+                    # Increment the segment progress
+                    td.sample_complete(
+                        complete=len(progress_results), total=len(samples)
                     )
 
-                    def sample_complete(sample_score: dict[str, SampleScore]) -> None:
-                        # Capture the result
-                        progress_results.append(sample_score)
-
-                        # Increment the segment progress
-                        td.sample_complete(
-                            complete=len(progress_results), total=len(samples)
-                        )
-
-                        # Update metrics
-                        update_metrics_display(
-                            len(progress_results),
-                            progress_results,
-                            scorers,
-                            task.epochs_reducer,
-                            task.metrics,
-                        )
-
-                    # initial progress
-                    td.sample_complete(complete=0, total=len(samples))
-
-                    # Update metrics to empty state
+                    # Update metrics
                     update_metrics_display(
                         len(progress_results),
                         progress_results,
@@ -311,127 +290,136 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
                         task.metrics,
                     )
 
-                    sample_results = await tg_collect(
-                        [
-                            functools.partial(
-                                task_run_sample,
-                                task_name=task.name,
-                                sample=sample,
-                                state=state,
-                                sandbox=sandbox,
-                                max_sandboxes=config.max_sandboxes,
-                                sandbox_cleanup=sandbox_cleanup,
-                                plan=plan,
-                                scorers=scorers,
-                                generate=generate,
-                                progress=progress,
-                                logger=logger if log_samples else None,
-                                log_images=log_images,
-                                sample_source=sample_source,
-                                sample_error=sample_error_handler,
-                                sample_complete=sample_complete,
-                                fails_on_error=(
-                                    config.fail_on_error is None
-                                    or config.fail_on_error is True
-                                ),
-                                time_limit=config.time_limit,
-                                working_limit=config.working_limit,
-                                semaphore=sample_semaphore,
-                            )
-                            for (sample, state) in zip(samples, states)
-                        ]
-                    )
+                # initial progress
+                td.sample_complete(complete=0, total=len(samples))
 
-                # compute and record metrics if we have scores
-                completed_scores = [
-                    score_dict
-                    for score_dict in sample_results
-                    if isinstance(score_dict, dict)
-                ]
+                # Update metrics to empty state
+                update_metrics_display(
+                    len(progress_results),
+                    progress_results,
+                    scorers,
+                    task.epochs_reducer,
+                    task.metrics,
+                )
 
-                if len(completed_scores) > 0:
-                    results, reductions = eval_results(
-                        samples=profile.samples,
-                        scores=completed_scores,
-                        reducers=task.epochs_reducer,
-                        scorers=scorers,
-                        metrics=task.metrics,
-                    )
+                sample_results = await tg_collect(
+                    [
+                        functools.partial(
+                            task_run_sample,
+                            task_name=task.name,
+                            log_location=profile.log_location,
+                            sample=sample,
+                            state=state,
+                            sandbox=sandbox,
+                            max_sandboxes=config.max_sandboxes,
+                            sandbox_cleanup=sandbox_cleanup,
+                            plan=plan,
+                            scorers=scorers,
+                            generate=generate,
+                            progress=progress,
+                            logger=logger if log_samples else None,
+                            log_images=log_images,
+                            sample_source=sample_source,
+                            sample_error=sample_error_handler,
+                            sample_complete=sample_complete,
+                            fails_on_error=(
+                                config.fail_on_error is None
+                                or config.fail_on_error is True
+                            ),
+                            retry_on_error=config.retry_on_error or 0,
+                            error_retries=[],
+                            time_limit=config.time_limit,
+                            working_limit=config.working_limit,
+                            semaphore=sample_semaphore,
+                        )
+                        for (sample, state) in zip(samples, states)
+                    ]
+                )
+
+            # compute and record metrics if we have scores
+            completed_scores = [
+                score_dict
+                for score_dict in sample_results
+                if isinstance(score_dict, dict)
+            ]
+
+            if len(completed_scores) > 0:
+                results, reductions = eval_results(
+                    samples=profile.samples,
+                    scores=completed_scores,
+                    reducers=task.epochs_reducer,
+                    scorers=scorers,
+                    metrics=task.metrics,
+                )
+
+            # collect eval data
+            collect_eval_data(stats)
+
+            # finish w/ success status
+            eval_log = await logger.log_finish("success", stats, results, reductions)
+
+            # display task summary
+            td.complete(
+                TaskSuccess(
+                    samples_completed=logger.samples_completed,
+                    stats=stats,
+                    results=results or EvalResults(),
+                )
+            )
+
+        except anyio.get_cancelled_exc_class():
+            with anyio.CancelScope(shield=True):
+                # collect eval data
+                collect_eval_data(stats)
+
+                # finish w/ cancelled status
+                eval_log = await logger.log_finish(
+                    "cancelled", stats, results, reductions
+                )
+
+                # display task cancelled
+                td.complete(TaskCancelled(logger.samples_completed, stats))
+
+        except BaseException as ex:
+            if options.debug_errors:
+                raise
+            else:
+                # get exception info
+                type, value, traceback = sys.exc_info()
+                type = type if type else BaseException
+                value = value if value else ex
+
+                # build eval error
+                error = eval_error(ex, type, value, traceback)
 
                 # collect eval data
                 collect_eval_data(stats)
 
-                # finish w/ success status
+                # finish with error status
                 eval_log = await logger.log_finish(
-                    "success", stats, results, reductions
+                    "error", stats, results, reductions, error
                 )
 
-                # display task summary
-                td.complete(
-                    TaskSuccess(
-                        samples_completed=logger.samples_completed,
-                        stats=stats,
-                        results=results or EvalResults(),
-                    )
-                )
+                # display it
+                td.complete(TaskError(logger.samples_completed, type, value, traceback))
 
-            except anyio.get_cancelled_exc_class():
-                with anyio.CancelScope(shield=True):
-                    # collect eval data
-                    collect_eval_data(stats)
+    # notify the view module that an eval just completed
+    # (in case we have a view polling for new evals)
+    view_notify_eval(logger.location)
 
-                    # finish w/ cancelled status
-                    eval_log = await logger.log_finish(
-                        "cancelled", stats, results, reductions
-                    )
+    try:
+        if (
+            await send_telemetry("eval_log_location", eval_log.location)
+            == "not_handled"
+        ):
+            # Converting the eval log to JSON is expensive. Only do so if
+            # eval_log_location was not handled.
+            await send_telemetry("eval_log", eval_log_json_str(eval_log))
+    except Exception as ex:
+        py_logger.warning(f"Error occurred sending telemetry: {exception_message(ex)}")
 
-                    # display task cancelled
-                    td.complete(TaskCancelled(logger.samples_completed, stats))
-
-            except BaseException as ex:
-                if options.debug_errors:
-                    raise
-                else:
-                    # get exception info
-                    type, value, traceback = sys.exc_info()
-                    type = type if type else BaseException
-                    value = value if value else ex
-
-                    # build eval error
-                    error = eval_error(ex, type, value, traceback)
-
-                    # collect eval data
-                    collect_eval_data(stats)
-
-                    # finish with error status
-                    eval_log = await logger.log_finish(
-                        "error", stats, results, reductions, error
-                    )
-
-                    # display it
-                    td.complete(
-                        TaskError(logger.samples_completed, type, value, traceback)
-                    )
-
-        # notify the view module that an eval just completed
-        # (in case we have a view polling for new evals)
-        view_notify_eval(logger.location)
-
-        try:
-            if (
-                await send_telemetry("eval_log_location", eval_log.location)
-                == "not_handled"
-            ):
-                # Converting the eval log to JSON is expensive. Only do so if
-                # eval_log_location was not handled.
-                await send_telemetry("eval_log", eval_log_json_str(eval_log))
-        except Exception as ex:
-            py_logger.warning(
-                f"Error occurred sending telemetry: {exception_message(ex)}"
-            )
-
-        # return eval log
-        return eval_log
+    # return eval log
+    return eval_log
 
 
 def update_metrics_display_fn(
@@ -499,7 +487,9 @@ def update_metrics_display_fn(
 
 
 async def task_run_sample(
+    *,
     task_name: str,
+    log_location: str,
     sample: Sample,
     state: TaskState,
     sandbox: SandboxEnvironmentSpec | None,
@@ -515,6 +505,8 @@ async def task_run_sample(
     sample_error: SampleErrorHandler,
     sample_complete: Callable[[dict[str, SampleScore]], None],
     fails_on_error: bool,
+    retry_on_error: int,
+    error_retries: list[EvalError],
     time_limit: int | None,
     working_limit: int | None,
     semaphore: anyio.Semaphore | None,
@@ -546,6 +538,9 @@ async def task_run_sample(
             sample_complete(sample_scores)
             return sample_scores
 
+    # copy variables that we may pass back to ourselves on a retry
+    initial_state = deepcopy(state)
+
     # use semaphore if provided
     semaphore_cm: anyio.Semaphore | contextlib.AbstractAsyncContextManager[None] = (
         semaphore if semaphore else contextlib.nullcontext()
@@ -576,20 +571,31 @@ async def task_run_sample(
 
     # helper to handle exceptions (will throw if we've exceeded the limit)
     def handle_error(ex: BaseException) -> tuple[EvalError, BaseException | None]:
-        err = sample_error(ex)
-        # if we aren't raising the error then print a warning
-        if err[1] is None:
-            py_logger.warning(
-                f"Sample error (id: {sample.id}, epoch: {state.epoch}): {exception_message(ex)})"
-            )
-        transcript()._event(ErrorEvent(error=err[0]))
-        return err
+        # helper to log sample error
+        def log_sample_error() -> None:
+            msg = f"Sample error (id: {sample.id}, epoch: {state.epoch}): {exception_message(ex)})"
+            if retry_on_error > 0:
+                msg = f"{msg}. Sample will be retried."
+            py_logger.warning(msg)
+
+        # if we have retries left then return EvalError
+        if retry_on_error > 0:
+            log_sample_error()
+            return eval_error(ex, type(ex), ex, ex.__traceback__), None
+        else:
+            err = sample_error(ex)
+            # if we aren't raising the error then print a warning
+            if err[1] is None:
+                log_sample_error()
+            transcript()._event(ErrorEvent(error=err[0]))
+            return err
 
     # solver loop
     async with (
         semaphore_cm,
         active_sample(
             task=task_name,
+            log_location=log_location,
             model=str(state.model),
             sample=sample,
             epoch=state.epoch,
@@ -597,7 +603,7 @@ async def task_run_sample(
             token_limit=state.token_limit,
             time_limit=time_limit,
             working_limit=working_limit,
-            fails_on_error=fails_on_error,
+            fails_on_error=fails_on_error or (retry_on_error > 0),
             transcript=sample_transcript,
         ) as active,
     ):
@@ -621,7 +627,7 @@ async def task_run_sample(
 
             async with sandboxenv_cm:
                 timeout_cm: (
-                    contextlib._GeneratorContextManager[anyio.CancelScope, None, None]
+                    contextlib._GeneratorContextManager[anyio.CancelScope]
                     | contextlib.nullcontext[None]
                 ) = contextlib.nullcontext()
                 try:
@@ -818,40 +824,84 @@ async def task_run_sample(
         except Exception as ex:
             error, raise_error = handle_error(ex)
 
-        # complete the sample
-        progress(SAMPLE_TOTAL_PROGRESS_UNITS)
+        # complete the sample if there is no error or if there is no retry_on_error in play
+        if not error or (retry_on_error == 0):
+            progress(SAMPLE_TOTAL_PROGRESS_UNITS)
 
-        # log it
+            # log it
+            if logger is not None:
+                # if we are logging images then be sure to base64 images injected by solvers
+                if log_images:
+                    state = (await states_with_base64_content([state]))[0]
+
+                # otherwise ensure there are no base64 images in sample or messages
+                else:
+                    sample = sample_without_base64_content(sample)
+                    state = state_without_base64_content(state)
+
+                # log the sample
+                await log_sample(
+                    start_time=start_time,
+                    logger=logger,
+                    sample=sample,
+                    state=state,
+                    scores=results,
+                    error=error,
+                    error_retries=error_retries,
+                    log_images=log_images,
+                )
+
+    # error that should be retried (we do this outside of the above scope so that we can
+    # retry outside of the original semaphore -- our retry will therefore go to the back
+    # of the sample queue)
+    if error and retry_on_error > 0:
+        # remove any buffered sample events
         if logger is not None:
-            # if we are logging images then be sure to base64 images injected by solvers
-            if log_images:
-                state = (await states_with_base64_content([state]))[0]
+            logger.remove_sample(state.sample_id, state.epoch)
 
-            # otherwise ensure there are no base64 images in sample or messages
-            else:
-                sample = sample_without_base64_content(sample)
-                state = state_without_base64_content(state)
+        # recurse w/ tick down of retry_on_error and append of error to error_retries
+        return await task_run_sample(
+            task_name=task_name,
+            log_location=log_location,
+            sample=sample,
+            # state was deep copied at the outset
+            state=initial_state,
+            sandbox=sandbox,
+            max_sandboxes=max_sandboxes,
+            sandbox_cleanup=sandbox_cleanup,
+            plan=plan,
+            scorers=scorers,
+            generate=generate,
+            progress=progress,
+            logger=logger,
+            log_images=log_images,
+            sample_source=sample_source,
+            sample_error=sample_error,
+            sample_complete=sample_complete,
+            fails_on_error=fails_on_error,
+            # tick retry count down
+            retry_on_error=retry_on_error - 1,
+            # forward on error that caused retry
+            error_retries=copy(error_retries) + [error],
+            time_limit=time_limit,
+            working_limit=working_limit,
+            semaphore=semaphore,
+        )
 
-            # log the sample
-            await log_sample(
-                start_time=start_time,
-                logger=logger,
-                sample=sample,
-                state=state,
-                scores=results,
-                error=error,
-                log_images=log_images,
-            )
+    # no error
+    elif error is None:
+        # call sample_complete callback if we have score results
+        if results is not None:
+            sample_complete(results)
+        return results
 
-        # return
-        if error is None:
-            if results is not None:
-                sample_complete(results)
-            return results
-        elif raise_error:
-            raise raise_error
-        else:
-            return None
+    # we have an error and should raise it
+    elif raise_error is not None:
+        raise raise_error
+
+    # we have an error and should not raise it
+    else:
+        return None
 
 
 async def log_sample(
@@ -861,6 +911,7 @@ async def log_sample(
     state: TaskState,
     scores: dict[str, SampleScore],
     error: EvalError | None,
+    error_retries: list[EvalError],
     log_images: bool,
 ) -> None:
     # sample must have id to be logged
@@ -906,6 +957,7 @@ async def log_sample(
         if total_time is not None
         else None,
         error=error,
+        error_retries=error_retries,
         limit=limit,
     )
 
@@ -916,7 +968,7 @@ async def resolve_dataset(
     dataset: Dataset,
     model_name: ModelName,
     limit: int | tuple[int, int] | None,
-    sample_id: str | int | list[str | int] | None,
+    sample_id: str | int | list[str] | list[int] | list[str | int] | None,
     epochs: int,
     log_images: bool,
     message_limit: int | None,

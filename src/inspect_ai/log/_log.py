@@ -64,7 +64,9 @@ class EvalConfig(BaseModel):
     limit: int | tuple[int, int] | None = Field(default=None)
     """Sample limit (number of samples or range of samples)."""
 
-    sample_id: str | int | list[str | int] | None = Field(default=None)
+    sample_id: str | int | list[str] | list[int] | list[str | int] | None = Field(
+        default=None
+    )
     """Evaluate specific sample(s)."""
 
     epochs: int | None = Field(default=None)
@@ -84,6 +86,9 @@ class EvalConfig(BaseModel):
     of total samples fails. Value greater than 1 to fail eval if a count
     of samples fails.
     """
+
+    retry_on_error: int | None = Field(default=None)
+    """Number of times to retry samples if they encounter errors."""
 
     message_limit: int | None = Field(default=None)
     """Maximum messages to allow per sample."""
@@ -252,6 +257,9 @@ class EvalSample(BaseModel):
 
     error: EvalError | None = Field(default=None)
     """Error that halted sample."""
+
+    error_retries: list[EvalError] | None = Field(default=None)
+    """Errors that were retried for this sample."""
 
     attachments: dict[str, str] = Field(default_factory=dict)
     """Attachments referenced from messages and events.
@@ -507,7 +515,7 @@ class EvalDataset(BaseModel):
     samples: int | None = Field(default=None)
     """Number of samples in the dataset."""
 
-    sample_ids: list[int | str] | None = Field(default=None)
+    sample_ids: list[str] | list[int] | list[str | int] | None = Field(default=None)
     """IDs of samples in the dataset."""
 
     shuffled: bool | None = Field(default=None)
@@ -701,7 +709,7 @@ def rich_traceback(
         exc_value=exc_value,
         traceback=exc_traceback,
         suppress=[click, asyncio, tenacity, sys.modules[PKG_NAME]],
-        show_locals=False,
+        show_locals=os.environ.get("INSPECT_TRACEBACK_LOCALS", None) == "1",
         width=CONSOLE_DISPLAY_WIDTH,
     )
     return rich_tb

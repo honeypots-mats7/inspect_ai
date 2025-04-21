@@ -2,6 +2,7 @@ from typing import Awaitable, Callable, NamedTuple, TypeAlias
 
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.scorer._metric import Score, ValueToFloat, value_to_float
+from inspect_ai.tool._tool import Tool
 
 DEFAULT_HANDOFF_PROMPT = """
 You are part of a multi-agent system designed to make agent coordination and
@@ -40,6 +41,12 @@ class AgentPrompt(NamedTuple):
     """Prompt for assistant (covers tool use, submit tool, CoT, etc.)."""
 
 
+DEFAULT_CONTINUE_PROMPT = """
+Please proceed to the next step using your best judgement. If you believe you
+have completed the task, please call the `{submit}()` tool.
+"""
+
+
 AgentContinue: TypeAlias = Callable[[AgentState], Awaitable[bool | str]]
 """Function called to determine whether the agent should continue.
 
@@ -74,8 +81,18 @@ class AgentAttempts(NamedTuple):
 class AgentSubmit(NamedTuple):
     """Configure the submit tool of a react agent."""
 
-    name: str = "submit"
-    """Name for submit tool."""
+    name: str | None = None
+    """Name for submit tool (defaults to 'submit')."""
 
-    description: str = "Submit an answer for evaluation."
-    """Description of submit tool."""
+    description: str | None = None
+    """Description of submit tool (defaults to 'Submit an answer for evaluation')."""
+
+    tool: Tool | None = None
+    """Alternate implementation for submit tool.
+
+    The tool can provide its `name` and `description` internally,
+    or these values can be overriden by the `name` and `description`
+    fields in `AgentSubmit`
+
+    The tool should return the `answer` provided to it for scoring.
+    """
